@@ -1,0 +1,1343 @@
+english+russian
+
+In this section, the students must be able to THOROUGHLY explain their Minimax-family algorithm. If they can not explain it
+well, then they do not understand it well enough, so do not grade this section. REPEAT : IF THE STUDENTS CAN NOT
+EXPLAIN THEIR ALGORITHM IN DETAIL, THEIR IMPLEMENTATION IS WORTH EXACTLY NOTHING, SO DO NOT GRADE
+THIS SECTION.
+
+## Русский (60–90 секунд)
+
+Мы используем Minimax-семейство в виде **iterative deepening alpha-beta** с несколькими оптимизациями.  
+Точка входа — `computeSimpleSuggestion`. Поиск идет по глубинам от 1 до 20 и ограничивается по времени примерно 465 мс. На каждой итерации мы сохраняем лучший найденный ход, поэтому при таймауте всегда возвращаем корректный промежуточный результат.
+
+Чтобы ускорить поиск, мы используем не полный перебор, а **генерацию кандидатов**: берем клетки рядом с существующими камнями, добавляем тактические точки, связанные с захватами и блокировками, оцениваем их быстрым `quickMoveScore` и ограничиваем количество рассматриваемых ходов на каждом ply. Это радикально уменьшает branching factor.
+
+В рекурсивном `alphaBeta` применяем:
+- **Transposition Table** на основе Zobrist-хэша,
+- **killer moves**,
+- **late move reductions** для поздних нетактических ходов,
+- и PVS-подобный подход: первый ход — полное окно, остальные — узкое окно с re-search при необходимости.
+Также на верхнем уровне используем **aspiration window** вокруг прошлого лучшего score.
+
+Оценочная функция учитывает специфику Gomoku с capture-правилами: разницу по захватам, угрозу добора до 10 захватов, уязвимые пары, потенциальные захваты, а также силу последовательностей (open/semi-open линии).  
+Итог: это не просто базовый Minimax, а гибридный, оптимизированный alpha-beta поиск, заточенный под тактику Gomoku.
+
+---
+
+## English (60–90 seconds)
+
+We use a Minimax-family algorithm implemented as **iterative deepening alpha-beta** with multiple optimizations.  
+The entry point is `computeSimpleSuggestion`. Search depth increases from 1 up to 20, with a strict time budget of about 465 ms. At each completed depth, we keep the best move, so if time runs out, we still return the best fully analyzed result.
+
+To keep it fast, we do not explore all empty cells. We use **candidate move generation**: cells near existing stones, tactical hotspots, and capture/block-related moves. Then we rank them with `quickMoveScore` and cap the number of moves per ply. This greatly reduces the branching factor.
+
+Inside recursive `alphaBeta`, we apply:
+- a **Transposition Table** with Zobrist hashing,
+- **killer moves**,
+- **late move reductions** for late non-tactical moves,
+- and a PVS-like approach: full window for the first move, null-window for the rest, with re-search when needed.
+At the root, we also use an **aspiration window** around the previous best score.
+
+Our evaluation function is Gomoku-specific with capture rules: capture lead, immediate race to 10 captures, vulnerable pairs, potential captures, and open/semi-open sequence patterns.  
+So this is not a plain textbook Minimax; it is a practical, optimized alpha-beta engine tailored for Gomoku tactics.
+
+---
+
+Если хочешь, дам еще версию **на 20–30 секунд** (супер-короткая, на случай если тебя перебивают).
+## Что у тебя за алгоритм (кратко)
+
+У тебя не «чистый Minimax», а усиленный вариант семейства Minimax:
+
+- `Iterative Deepening` (углубление по глубинам 1..N)
+- `Alpha-Beta pruning`
+- `PVS / NegaScout-подобный узкий поиск` (null-window для не первого хода)
+- `Aspiration Window`
+- `Transposition Table` на `Zobrist hash`
+- `Killer moves`
+- `LMR` (late move reductions)
+- агрессивная эвристика генерации кандидатов (сильное сужение ветвления)
+- жёсткий тайм-бюджет на поиск
+
+Ключевые параметры видны здесь:
+
+```16:33:src/AI.cpp
+namespace gomoku
+{
+    namespace
+    {
+        constexpr int MAX_SEARCH_DEPTH = 20;
+        constexpr int SEARCH_TIME_BUDGET_MS = 465;
+        constexpr int WIN_SCORE = 10000000;
+        constexpr int INF_SCORE = 100000000;
+        constexpr int ASPIRATION_WINDOW = 5000;
+        constexpr int KILLER_BONUS = 50000;
+        constexpr int PV_ROOT_SORT_BONUS = 1000000;
+```
+
+---
+
+## Как ход вычисляется пошагово
+
+### 1) Точка входа: `computeSimpleSuggestion(...)`
+
+Алгоритм запускается в `computeSimpleSuggestion`:  
+- проверяет терминал,
+- ставит дедлайн,
+- строит root-кандидаты,
+- крутит глубины 1..`MAX_SEARCH_DEPTH`,
+- на каждой глубине ищет лучший ход.
+
+```1005:1043:src/AI.cpp
+// Public entry point: iterative deepening search that returns best move and debug data.
+SuggestionResult computeSimpleSuggestion(const GameState& game, CellState player)
+{
+    SuggestionResult result;
+    result.depth = 0;
+    result.perspective = (player == CellState::Black) ? "Blue" : "Red";
+    result.scoreSource = "search";
+...
+    SearchStats stats;
+    stats.deadline = std::chrono::steady_clock::now() + std::chrono::milliseconds(SEARCH_TIME_BUDGET_MS);
+```
+
+### 2) Таймер и остановка
+
+Проверка таймаута не на каждом узле, а примерно раз в 64 посещения (`nodesExplored & 63`), это баланс «точность дедлайна / скорость».
+
+```70:83:src/AI.cpp
+// Checks whether the time budget is exceeded and latches timeout state.
+bool searchTimedOut(SearchStats& stats)
+{
+    if (stats.timedOut)
+        return true;
+
+    if ((stats.nodesExplored & 63) == 0 && std::chrono::steady_clock::now() >= stats.deadline)
+    {
+        stats.timedOut = true;
+        return true;
+    }
+
+    return false;
+}
+```
+
+### 3) Генерация ходов (самое важное для скорости)
+
+Ты **не перебираешь все пустые клетки**.  
+Сначала маркируешь только зоны около существующих камней, добавляешь tactical hotspots, форсируешь клетки захватов/блоков при capture race, потом сортируешь `quickMoveScore` и берёшь ограниченный `limit`.
+
+```613:771:src/AI.cpp
+// Generates and orders candidate moves with tactical filtering and limits.
+std::vector<Position> generateCandidateMoves(
+    const GameState& game,
+    CellState player,
+    int ply,
+    const std::array<Position, 4>* killersAtPly)
+{
+...
+    const int limit = effectiveCandidateLimit(ply, game);
+    for (std::size_t i = 0; i < scoredMoves.size() && static_cast<int>(moves.size()) < limit; ++i)
+        moves.push_back(scoredMoves[i].second);
+```
+
+Это критично: эффективность у тебя достигается не только alpha-beta, а прежде всего **умным сужением дерева**.
+
+### 4) Рекурсивный поиск `alphaBeta`
+
+На каждом узле:
+- terminal/depth/time check
+- lookup в TT
+- генерация и упорядочивание ходов
+- первый ход — full window
+- остальные — узким окном (PVS-стиль), при необходимости re-search
+- обновление alpha/beta
+- cutoff + запись killer move
+- запись результата в TT с типом bound (Exact/Lower/Upper)
+
+```787:963:src/AI.cpp
+// Principal alpha-beta search with TT, killer moves, and reductions.
+int alphaBeta(
+    const GameState& game,
+    int depthRemaining,
+    int alpha,
+    int beta,
+    CellState maximizingPlayer,
+    SearchStats& stats,
+    int ply)
+{
+...
+    if (e.bound == TTBound::Exact)
+        return e.score;
+...
+    else if (maximizing)
+    {
+        value = alphaBeta(
+            next,
+            childDepth,
+            alpha,
+            alpha + 1,
+...
+```
+
+### 5) LMR и killer heuristic
+
+Ты уменьшаешь глубину для поздних ходов (если позиция не тактическая по захватам), это и есть `late move reduction`:
+- начиная примерно с 3-го хода на слое — `-1`,
+- ещё уменьшение для более поздних ходов и больших глубин.
+
+Killer-ходы хранятся по `ply` и поднимаются вверх при beta-cutoff.
+
+### 6) Aspiration window + iterative deepening
+
+На глубинах >1 ты ищешь не в `[-INF, +INF]`, а в окне около прошлого `bestScore`.  
+Если промахнулся (fail-low/fail-high) — перезапуск широким окном.
+
+Это видно в блоке `windowAlpha/windowBeta` и повторном `runRootMoves(-INF, INF)`.
+
+---
+
+## Что именно оценивает твоя эвристика (`evaluateBoardState`)
+
+Твоя оценка — смесь:
+- состояния захватов (`capturesBlack/White`) и capture race до 10
+- потенциала захватов в neighbourhood
+- открытости пар (`doubleOpen`, `semiOpen`)
+- штрафов за уязвимые пары
+- силы линий (последовательности длиной 2/3/4/5 с учетом открытых концов)
+- контекста последнего хода
+
+```415:484:src/AI.cpp
+// Full static evaluation of the current position from maximizingPlayer perspective.
+int evaluateBoardState(const GameState& game, CellState maximizingPlayer, int ply)
+{
+...
+    score += (myCaptures - oppCaptures) * 3200;
+...
+    score += evaluatePotentialCaptures(game.board, maximizingPlayer, captureNeighborhood) * 1750;
+    score -= evaluatePotentialCaptures(game.board, opponent, captureNeighborhood) * 3400;
+...
+    score += evaluateSequences(game.board, maximizingPlayer);
+    score -= evaluateSequences(game.board, opponent);
+```
+
+---
+
+## Как это встроено в игру (поток выполнения)
+
+В режиме `VsAI` ты запускаешь поиск в отдельном потоке (`launchAiSearch`), а главный цикл UI не блокируется.  
+Когда результат готов — забираешь `SuggestionResult` и делаешь `engine.play(...)`.
+
+```69:97:src/Controller.cpp
+void launchAiSearch(const GameState& snapshot, CellState player)
+{
+...
+    std::thread([snapshot, player, generation]() {
+        SuggestionResult suggestion = computeSimpleSuggestion(snapshot, player);
+...
+    }).detach();
+}
+```
+
+---
+
+## Как объяснить на защите «идеально»
+
+Если спросят «что за Minimax у вас?», отвечай так:
+
+1. «Это alpha-beta поиск с iterative deepening до глубины 20 и ограничением по времени 465ms».  
+2. «На каждом слое мы не рассматриваем все ходы: генерируем тактически релевантные кандидаты и жёстко ограничиваем branching factor».  
+3. «Используем TT (Zobrist), killer moves, PVS-style узкий поиск и LMR для поздних ходов».  
+4. «Оценка позиции ориентирована на специфику Gomoku с captures: race до 10 захватов, уязвимые пары, открытые последовательности».  
+5. «Поскольку игра GUI, поиск крутится асинхронно в отдельном потоке, UI остаётся отзывчивым».
+
+Если хочешь, следующим сообщением сделаю тебе готовый **устный скрипт на 60–90 секунд** (RU + EN), который можно практически дословно проговорить экзаменатору.
+
+
+
+
+Search space
+Evaluate the search space of the algorithm
+- Entire board -> 0
+- Rectangular window around all placed stones -> 3
+- Multiple rectangular windows emcompassing placed stones but
+minimizing wasted space -> 5
+
+For your implementation, this section should be evaluated as **5** (best tier), with a short justification like this:
+
+- The algorithm does **not** search the entire board.
+- It does **not** use a single rectangular window either.
+- It builds a **dynamic candidate set** around placed stones (`marked` cells in a local radius), then adds extra tactical cells (captures, blocking, tactical hotspots), and finally trims by score/limit.
+
+So your search space is actually **more selective than multiple rectangles**: it is a sparse, tactical move mask that minimizes wasted space even better than simple rectangular partitioning.
+
+If you want a one-line defense answer:
+
+> “Our search space is generated as a dynamic set of tactical candidate cells around existing stones (plus forced capture/block moves), not full-board and not one fixed rectangle; therefore it matches the highest category (5).”
+
+
+Для твоей реализации здесь оценка — **5**.
+
+Почему:
+- Поиск идет **не по всей доске**.
+- Это **не один общий прямоугольник**.
+- У тебя формируется **динамический набор кандидатных клеток** вокруг уже поставленных камней, плюс добавляются тактические клетки (захваты, блокировки, hot spots), после чего кандидаты сортируются и ограничиваются по количеству.
+
+То есть пространство поиска у тебя минимизируется даже лучше, чем «несколько прямоугольников», поэтому это уровень **5**.
+
+Короткий ответ для защиты:
+> «Мы не используем полный перебор и не используем один прямоугольник. Мы строим динамическую тактическую область поиска вокруг камней и критических позиций, поэтому это максимальный уровень — 5.»
+
+
+Heuristic
+In this section, the students must be able to THOROUGHLY explain their heuristic function. If they can not explain it well, then
+they do not understand it well enough, so do not grade this section. REPEAT : IF THE STUDENTS CAN NOT EXPLAIN THEIR
+HEURISTIC IN DETAIL, THEIR IMPLEMENTATION IS WORTH EXACTLY NOTHING, SO DO NOT GRADE THIS SECTION.
+
+
+
+Sure — here is a clean **English defense version** you can say.
+
+Our heuristic is implemented in `evaluateBoardState` and returns a numeric score from the perspective of the maximizing player.  
+If the game is already over, we use terminal scoring first: a very large positive value for a win, a very large negative value for a loss, and 0 for neutral terminal states. This guarantees that forced wins/losses dominate any positional estimate.
+
+For non-terminal positions, the score is a weighted combination of tactical and positional features:
+
+- capture lead (`myCaptures - oppCaptures`),
+- immediate capture-race pressure near the 10-capture win condition,
+- potential captures available in relevant neighborhoods,
+- vulnerable pair structures and pair openness (double-open / semi-open),
+- sequence strength (open and semi-open lines of length 2, 3, 4, and 5+),
+- and local tactical pressure around recent threats.
+
+The key design choice is that this is **capture-aware Gomoku**, so capture-related terms are heavily weighted to avoid tactical blindness.  
+At the same time, line-shape scoring keeps long-term positional quality.
+
+This heuristic is used at leaf nodes in the alpha-beta search.  
+So the search decides *which line to follow*, and the heuristic defines *what “good position” means* in that line.  
+In short, our evaluation balances immediate tactical survival (especially captures) with strategic line development.
+
+Отлично, объясняю **детально и по сути**, чтобы ты мог это проговорить на защите.
+
+## Что такое эвристика в твоем проекте
+
+Эвристика — это функция, которая ставит позиции числовую оценку (`score`), когда поиск не дошел до конца партии.  
+В твоем проекте это `evaluateBoardState()` в `src/AI.cpp`.
+
+Логика такая:
+- чем лучше позиция для `maximizingPlayer`, тем выше score;
+- чем лучше для соперника, тем ниже score;
+- Minimax/alpha-beta выбирает ход, который максимизирует эту оценку (с учетом ответа соперника).
+
+---
+
+## 1) Базовый принцип оценки
+
+В `evaluateBoardState()` сначала проверяются терминальные состояния:
+- если игра окончена и победил наш игрок — очень большой плюс (`WIN_SCORE` с поправкой на `ply`, чтобы быстрее победить);
+- если победил соперник — большой минус;
+- если ничья/конец без победителя — 0.
+
+Это важно: терминал всегда приоритетнее любых «позиционных» факторов.
+
+---
+
+## 2) Что именно входит в эвристику (факторы)
+
+Твоя функция — это **сумма нескольких тематических блоков**.
+
+### A. Разница по захватам
+Учитывается `myCaptures - oppCaptures` с весом.  
+Смысл: в варианте Gomoku с capture-механикой это стратегически критично, поэтому уже сам перевес по захватам меняет оценку.
+
+### B. Гонка до 10 захватов (capture race)
+Если кто-то близко к порогу (8+), включается «тактический слой»:
+- оценивается, можно ли добрать до 10 прямо сейчас;
+- если да у нас — очень большой плюс;
+- если может соперник — очень большой минус.
+
+Это защита от типичной ошибки: «красивый позиционный ход» вместо обязательной тактики на захват-победу.
+
+### C. Потенциальные захваты
+Считаются потенциальные capture-возможности в окрестностях камней:
+- свои потенциальные захваты добавляют очки;
+- потенциальные захваты соперника вычитаются (часто с более сильным штрафом, чтобы ИИ лучше защищался).
+
+### D. Уязвимые пары / открытые пары
+Есть блоки типа:
+- `countPairOpenness` (double-open / semi-open пары),
+- `evaluateVulnerablePairs`.
+
+Идея: пары камней, которые можно «съесть», — это тактический риск.  
+Поэтому:
+- уязвимость своих структур штрафуется;
+- уязвимость структур соперника поощряется.
+
+### E. Последний ход соперника
+Если последний ход соперника усилил его линию, добавляется штраф.  
+Это повышает тактическую «чувствительность» к только что возникшим угрозам.
+
+### F. Последовательности камней (shape-based scoring)
+Через `evaluateSequences` + `sequenceScore` ты оцениваешь формы:
+- длина 5+ — огромная ценность;
+- открытая 4 намного сильнее закрытой 4;
+- открытая 3 сильнее полуоткрытой;
+- для 2 и 1 — маленькие бонусы.
+
+Это классика для Gomoku: оценивается не только длина, но и **открытость концов**.
+
+---
+
+## 3) Почему это работает вместе
+
+Твоя эвристика балансирует 3 уровня:
+
+1. **Терминальный/форсированный**  
+   Победа/поражение/capture race до 10.
+
+2. **Тактический**  
+   Угрозы захватов, уязвимые пары, немедленные риски.
+
+3. **Позиционный**  
+   Качество фигурных структур (open/semi-open линии).
+
+Из-за этого ИИ:
+- не «тонет» в чисто позиционных оценках;
+- видит тактику захватов;
+- при этом умеет строить длинные линии.
+
+---
+
+## 4) Как это связано с поиском Minimax
+
+Эвристика не работает отдельно — она листовая функция для alpha-beta:
+- когда depth=0, возвращается `evaluateBoardState`;
+- эти значения поднимаются вверх по дереву;
+- на максимизирующих слоях берется максимум, на минимизирующих — минимум;
+- pruning отсекает ветви, но качество выбора зависит от этой оценки.
+
+То есть: **эвристика определяет “что считать хорошей позицией”, поиск определяет “какой ход к такой позиции ведет”**.
+
+---
+
+## 5) Как проговорить это экзаменатору (готовая формулировка)
+
+«Наша эвристика — это взвешенная оценка позиции с приоритетом терминальных исходов.  
+Сначала мы обрабатываем победу/поражение. Затем учитываем capture-механику: разницу захватов, возможность немедленно дойти до 10, потенциальные захваты и уязвимые пары. Отдельно оцениваем структуру линий через open/semi-open последовательности. Итоговый score — это линейная комбинация этих факторов с разными весами для атаки и защиты. Этот score используется в листьях alpha-beta поиска и определяет стратегию выбора хода.»
+
+---
+
+Если хочешь, следующим сообщением сделаю тебе:
+- **короткую версию на 30 секунд**,
+- и **версию на английском** для устного ответа слово в слово.
+
+
+
+Static part - Alignments
+Does the heuristic take current alignments into account ?
+
+Да, **учитывает**.
+
+В твоей эвристике alignments (линии/цепочки камней) обрабатываются в `src/AI.cpp` через эти функции:
+
+- `lineLengthIfPlaced(...)` — считает длину линии, если поставить камень в позицию.
+- `lineLengthExisting(...)` — считает длину уже существующей линии через занятую клетку.
+- `maxLineLengthIfPlaced(...)` — берёт максимальную длину линии по 4 направлениям.
+- `maxLineLengthAt(...)` — максимальная длина линии в точке для уже стоящего камня.
+- `sequenceScore(...)` — переводит `(length, openEnds)` в эвристический вес (open/semi-open alignment scoring).
+- `evaluateSequences(...)` — проходит по доске и суммирует оценки всех alignments.
+- `quickMoveScore(...)` — использует `maxLineLengthIfPlaced(...)` для приоритизации ходов (в т.ч. win/block по линиям).
+- `evaluateBoardState(...)` — финально включает оценку alignments через:
+  - `score += evaluateSequences(... maximizingPlayer)`
+  - `score -= evaluateSequences(... opponent)`
+  - и штраф за сильную последнюю линию соперника через `maxLineLengthAt(...)`.
+
+Если нужен короткий ответ для чеклиста:
+
+> **Yes** — current alignments are explicitly evaluated in `sequenceScore`, `evaluateSequences`, `lineLengthIfPlaced`, `lineLengthExisting`, `maxLineLengthIfPlaced`, `maxLineLengthAt`, and integrated into final heuristic in `evaluateBoardState` (plus move ordering in `quickMoveScore`).
+
+
+Static part - Potential win by alignment
+Does the heuristic check whether an alignment has enough space
+to develop into a 5-in-a-row ?
+
+Yes — your heuristic does check this, in a practical static way.
+
+It evaluates whether an alignment has room to grow via **open ends**:
+
+- In `evaluateSequences(...)`, each sequence gets an `openEnds` count (0, 1, or 2).
+- In `sequenceScore(length, openEnds)`, the score strongly depends on both length and openness:
+  - open four is much stronger than closed four,
+  - open/semi-open threes and twos are scored differently.
+- This is exactly how the heuristic estimates whether a line can realistically develop into a 5-in-a-row.
+
+Also, in `quickMoveScore(...)`, `maxLineLengthIfPlaced(...)` is used to detect immediate line-completion or blocking opportunities.
+
+So the correct defense answer is:  
+**Yes, it checks potential 5-in-a-row development through sequence length plus open-end availability.**
+
+
+
+Да, **проверяет частично и явно** через «открытость» линии.
+
+Как это сделано у тебя:
+
+- В `evaluateSequences(...)` для каждой последовательности считается `openEnds` (0/1/2) — свободные клетки по краям.
+- Затем `sequenceScore(length, openEnds)` даёт вес:
+  - open 4 (`length == 4`, `openEnds == 2`) оценивается намного выше, чем закрытая,
+  - open/semi-open 3 и 2 тоже различаются.
+- Это и есть проверка, есть ли у alignment пространство, чтобы дорасти до 5.
+
+Дополнительно:
+- В `quickMoveScore(...)` используется `maxLineLengthIfPlaced(...)` для проверки, может ли ход сразу сделать/заблокировать 5.
+
+Важно сформулировать точно на защите:
+- У тебя нет отдельной сложной функции «достижимость 5 через несколько ходов с разрывами»,  
+- но есть рабочая статическая аппроксимация через `length + openEnds`, что в практике и означает «достаточно пространства для развития линии».
+
+Static part - Freedom
+Does the heuristic weigh an alignment according to its freedom
+(Free, half-free, flanked) ?
+
+Yes — it does.
+
+Your heuristic explicitly models alignment freedom using **open ends**:
+
+- `evaluateSequences(...)` computes how many ends of a sequence are open (`openEnds = 0, 1, 2`).
+- `sequenceScore(length, openEnds)` assigns different scores based on that value.
+
+Mapping to your terms:
+- **Free** = `openEnds == 2`
+- **Half-free** = `openEnds == 1`
+- **Flanked/blocked** = `openEnds == 0`
+
+So freedom is directly included in the static evaluation, and it significantly changes the score of the same alignment length.
+
+Static part - Potential captures
+Does the heuristic take potential captures into account ?
+
+Yes, it does.
+
+Your heuristic explicitly includes potential captures:
+
+- In `evaluateBoardState(...)`, it calls `evaluatePotentialCaptures(...)` for both players.
+- It adds your side’s potential captures and subtracts the opponent’s potential captures (with different weights).
+- It also includes extra capture-race pressure near the 10-capture win condition (`maxCaptureGainAnyMove(...)` logic when captures are high).
+
+So potential captures are not just present — they are a core part of your static evaluation.
+
+
+
+Static part - Captures
+Does the heuristic take current captured stones into account ?
+
+Yes.
+
+Your heuristic directly uses the **current capture counts**:
+
+- In `evaluateBoardState(...)`, it reads `capturesBlack` / `capturesWhite`,
+- computes `myCaptures` and `oppCaptures`,
+- and applies a score term based on `(myCaptures - oppCaptures)`.
+
+It also adds extra capture-related logic when either side is close to the capture-win threshold (near 10), so current captures have both a baseline and tactical impact.
+
+Да, учитывает.
+
+В твоей эвристике текущие захваты используются напрямую:
+
+- В `evaluateBoardState(...)` читаются `capturesBlack` и `capturesWhite`.
+- Из них вычисляются `myCaptures` и `oppCaptures`.
+- В итоговый score добавляется вклад от разницы захватов `(myCaptures - oppCaptures)`.
+
+Также есть дополнительный тактический блок, когда одна из сторон близка к победе по захватам (около 10), поэтому текущие захваты влияют и на базовую, и на критическую оценку позиции.
+
+
+Static part - Figures
+Does the heuristic check for advanteageous combinations ?
+
+Yes.
+
+Your heuristic does check advantageous figure/shape combinations, not just raw line length:
+
+- `evaluateSequences(...)` + `sequenceScore(...)` evaluate pattern quality by **length + openness** (open/semi-open structures).
+- `countPairOpenness(...)` adds value/penalty for structurally important pair configurations (`doubleOpen`, `semiOpen`).
+- `evaluateVulnerablePairs(...)` models tactical pair patterns that can become capture liabilities.
+- `evaluatePotentialCaptures(...)` and related capture-race logic evaluate profitable tactical combinations around stones.
+
+So the static evaluation includes multiple advantageous (and dangerous) combinations of stones, both positional and tactical.
+
+Да, проверяет.
+
+Твоя эвристика учитывает выгодные комбинации фигур, а не только длину линии:
+
+- `evaluateSequences(...)` + `sequenceScore(...)` оценивают качество шаблонов по **длине и открытости** (open/semi-open).
+- `countPairOpenness(...)` учитывает важные парные структуры (`doubleOpen`, `semiOpen`).
+- `evaluateVulnerablePairs(...)` выявляет тактически уязвимые пары (риск захвата).
+- `evaluatePotentialCaptures(...)` и блок capture-race оценивают выгодные тактические комбинации вокруг камней.
+
+Итог: статическая часть у тебя действительно учитывает комбинации (и выгодные, и опасные), а не работает как примитивный «подсчет длины».
+
+Static part - Players
+Does the heuristic take both players into account ?
+
+Yes, absolutely.
+
+Your heuristic is explicitly two-sided:
+
+- In `evaluateBoardState(...)`, it computes values for both `maximizingPlayer` and `opponent`.
+- It adds your side’s strengths and subtracts the opponent’s strengths (captures, sequence quality, potential captures, pair structure effects, etc.).
+- Final score is always from one player’s perspective, but built from **both players’ features**.
+
+So this criterion is clearly satisfied: the heuristic evaluates both players, not just the current player in isolation.
+
+Да, полностью учитывает обоих игроков.
+
+В `evaluateBoardState(...)`:
+- отдельно вычисляются показатели для текущего максимизирующего игрока и для соперника;
+- свои преимущества прибавляются, преимущества соперника вычитаются;
+- это делается по нескольким группам признаков: захваты, потенциальные захваты, последовательности, уязвимые/открытые пары и т.д.
+
+Итог: оценка строится не «в вакууме» для одного игрока, а как разница силы **двух сторон**.
+
+
+Вот этот участок:
+
+```416:485:src/AI.cpp
+int evaluateBoardState(const GameState& game, CellState maximizingPlayer, int ply)
+{
+    ...
+    const CellState opponent = opponentOf(maximizingPlayer);
+    const int myCaptures = (maximizingPlayer == CellState::Black) ? game.capturesBlack : game.capturesWhite;
+    const int oppCaptures = (opponent == CellState::Black) ? game.capturesBlack : game.capturesWhite;
+
+    int score = 0;
+
+    score += (myCaptures - oppCaptures) * 3200;
+    ...
+    score += evaluatePotentialCaptures(game.board, maximizingPlayer, captureNeighborhood) * 1750;
+    score -= evaluatePotentialCaptures(game.board, opponent, captureNeighborhood) * 3400;
+    ...
+    score -= evaluateVulnerablePairs(game.board, maximizingPlayer) * 2600;
+    score += evaluateVulnerablePairs(game.board, opponent) * 1400;
+    ...
+    score += evaluateSequences(game.board, maximizingPlayer);
+    score -= evaluateSequences(game.board, opponent);
+
+    return score;
+}
+```
+
+Ключевой момент: в одном и том же `score` ты **прибавляешь свои плюсы** и **вычитаешь плюсы соперника** — это и есть учёт обоих игроков.
+
+Dynamic part
+Does the heuristic take past player actions into account to
+identify patterns and weigh board states accordingly ?
+
+Коротко: **да, частично**.
+
+Что у тебя реально учитывается из прошлого:
+
+- **Последний ход** через `game.lastMove` в `evaluateBoardState(...)`  
+  (если последний ход принадлежит сопернику, добавляется штраф за его сильную линию).
+- **Накопленные захваты** (`capturesBlack`, `capturesWhite`) — это тоже история прошлых действий, и она сильно влияет на score.
+- **Состояние доски** как итог всей истории ходов (все паттерны строятся по текущей позиции, которая уже содержит прошлые решения игроков).
+
+Что **не** делается:
+- нет отдельной модели длинной истории типа «последовательность последних N ходов», «стиль игрока», «repetition learning» и т.п.
+
+Поэтому корректный ответ для защиты:
+> **Yes, partially** — the heuristic incorporates past actions through cumulative game state (capture counts) and explicit `lastMove` context, but it does not model long temporal action sequences beyond what is encoded in the current board state.
+
+
+
+
+Сделаю максимально подробно здесь в сообщении.  
+Сейчас я в **Ask mode**, поэтому не могу физически создать файл, но ты можешь просто скопировать этот текст в `src/answers`.
+
+---
+
+## Русская версия (подробный готовый ответ)
+
+### Вопрос
+**“In this section, the students must be able to THOROUGHLY explain their Minimax-family algorithm… if they cannot explain it, do not grade this section.”**
+
+### Подробный ответ
+Этот пункт означает, что в разделе Minimax оценивается не только факт наличия работающего кода, но в первую очередь **глубина понимания алгоритма студентом**.  
+Если студент не может детально объяснить, как именно работает его Minimax-алгоритм и почему он принимает те или иные решения, проверяющий обязан считать, что студент не владеет реализацией, и поставить **0 за раздел**, даже если программа запускается.
+
+Под «detaily explain» обычно требуется уметь последовательно и технически корректно раскрыть:
+
+1. **Основу Minimax**
+- что в дереве есть максимизирующие и минимизирующие уровни;
+- как формируется значение узла через `max` или `min` значений детей;
+- что означает «лучший ход» для текущего игрока.
+
+2. **Условия остановки поиска**
+- терминальные позиции (победа/поражение/конец игры);
+- ограничение по глубине;
+- ограничение по времени (если используется).
+
+3. **Эвристическую оценку**
+- какие признаки входят в оценочную функцию;
+- какие признаки усиливают/ослабляют позицию;
+- почему эти признаки выбраны;
+- как интерпретируется итоговый score.
+
+4. **Alpha-Beta pruning**
+- что такое alpha и beta;
+- при каком условии ветвь отсекается;
+- почему отсечение не меняет корректность итогового выбора по сравнению с чистым minimax.
+
+5. **Оптимизации конкретной реализации**
+- iterative deepening;
+- move ordering;
+- transposition table / Zobrist hash;
+- killer moves, LMR, aspiration windows и т.д. (если есть);
+- зачем они нужны и как влияют на скорость/качество.
+
+6. **Практический баланс “качество vs время”**
+- почему нельзя искать до конца;
+- как выбранные лимиты и эвристики влияют на стабильность и силу AI.
+
+### Ключевой смысл требования
+Требование специально сформулировано жёстко:  
+если студент не может объяснить алгоритм подробно, значит он не доказал авторство и понимание решения.  
+Поэтому реализация в этом разделе считается **незачтённой (0)**.
+
+### Короткая формулировка для защиты
+> В этом пункте проверяется именно понимание Minimax-алгоритма. Если студент не способен детально объяснить структуру поиска, оценочную функцию, отсечения и оптимизации, раздел не оценивается и получает 0, даже при рабочем коде.
+
+---
+
+## English Version (detailed ready-to-use answer)
+
+### Question
+**“In this section, the students must be able to THOROUGHLY explain their Minimax-family algorithm… if they cannot explain it, do not grade this section.”**
+
+### Detailed answer
+This requirement means that Minimax grading is based not only on having runnable code, but primarily on the student’s **technical understanding** of their own algorithm.  
+If a student cannot explain in detail how their Minimax-family implementation works and why it chooses specific moves, the evaluator must treat this as insufficient understanding and assign **0 for this section**, even if the program runs.
+
+“Thorough explanation” typically requires the student to clearly explain:
+
+1. **Core Minimax logic**
+- alternating maximizing and minimizing layers;
+- how node values are propagated (`max` vs `min`);
+- what “best move” means from the current player’s perspective.
+
+2. **Search stopping conditions**
+- terminal states (win/loss/end);
+- depth limit;
+- time budget (if used).
+
+3. **Heuristic evaluation**
+- which features are included in the evaluation function;
+- how features increase/decrease score;
+- why these features were selected;
+- how final score is interpreted.
+
+4. **Alpha-Beta pruning**
+- what alpha and beta represent;
+- the exact pruning condition;
+- why pruning preserves correctness relative to full minimax.
+
+5. **Implementation-specific optimizations**
+- iterative deepening;
+- move ordering;
+- transposition tables / Zobrist hashing;
+- killer moves, LMR, aspiration windows, etc. (if present);
+- why each optimization is used and its impact.
+
+6. **Quality vs time trade-off**
+- why full search is infeasible;
+- how limits and heuristics affect practical strength and consistency.
+
+### Core meaning of the rule
+The wording is intentionally strict:  
+if the student cannot thoroughly explain the algorithm, they have not demonstrated real understanding or ownership of the implementation.  
+Therefore, this section must be considered **not gradable and scored 0**.
+
+### Short defense-ready version
+> This criterion evaluates understanding, not just execution. If a student cannot thoroughly explain search structure, evaluation logic, pruning, and optimizations, the section must not be graded and receives 0, even if the code runs.
+
+---
+
+Если хочешь, я сделаю следующем сообщением версию **в формате “Q/A для устного экзамена”** (10–15 типичных вопросов с готовыми ответами на русском и английском).
+
+
+
+## Q/A for Oral Defense (RU + EN)
+
+### 1) Что такое Minimax в вашем проекте?
+**RU:** Это поиск по дереву ходов, где наш игрок максимизирует оценку позиции, а соперник минимизирует. Значение узла получается из лучших ответов обеих сторон.  
+**EN:** It is a game-tree search where our side maximizes position score and the opponent minimizes it. Node values come from best responses on alternating layers.
+
+### 2) Почему вы не делаете полный перебор до конца партии?
+**RU:** Потому что дерево слишком большое (комбинаторный взрыв). Полный перебор нереален по времени, поэтому мы используем ограниченную глубину/время и эвристику.  
+**EN:** Because the tree is too large (combinatorial explosion). Full search is infeasible, so we use depth/time limits and heuristic evaluation.
+
+### 3) Что делает Alpha-Beta pruning?
+**RU:** Отсекает ветви, которые уже не могут улучшить текущий результат при заданных границах alpha и beta. Это ускоряет поиск без изменения корректного minimax-результата.  
+**EN:** It prunes branches that cannot improve the current result under alpha/beta bounds. It speeds up search without changing the correct minimax outcome.
+
+### 4) Что такое alpha и beta?
+**RU:** `alpha` — лучшая гарантированная оценка для максимизатора на текущем пути; `beta` — лучшая гарантированная оценка для минимизатора. Если `alpha >= beta`, ветка отсекается.  
+**EN:** `alpha` is the best guaranteed value for the maximizer so far; `beta` is the best guaranteed value for the minimizer. If `alpha >= beta`, we prune.
+
+### 5) Как работает ваша эвристика?
+**RU:** Это взвешенная сумма тактических и позиционных признаков: захваты, потенциальные захваты, уязвимые/открытые пары, качество последовательностей (длина + открытые концы), контекст угроз.  
+**EN:** It is a weighted combination of tactical and positional features: captures, potential captures, vulnerable/open pairs, sequence quality (length + open ends), and threat context.
+
+### 6) Учитываете ли вы обе стороны в оценке?
+**RU:** Да. Мы считаем признаки для нашего игрока и для соперника, затем добавляем свои бонусы и вычитаем преимущества соперника.  
+**EN:** Yes. We evaluate both players’ features, add our strengths, and subtract opponent strengths.
+
+### 7) Учитываются ли потенциальные победы по линии (5 в ряд)?
+**RU:** Да, через оценку последовательностей и свободы концов: open/semi-open структуры получают разные веса; это отражает реальную достижимость 5 в ряд.  
+**EN:** Yes, via sequence and openness scoring: open/semi-open structures are weighted differently, which models realistic 5-in-a-row potential.
+
+### 8) Учитываются ли захваты в статической оценке?
+**RU:** Да, напрямую через текущие счетчики захватов и через дополнительные тактические термы, особенно при близости к порогу победы по захватам.  
+**EN:** Yes, directly through current capture counts and additional tactical terms, especially near the capture-win threshold.
+
+### 9) Что такое move ordering и зачем он нужен?
+**RU:** Это предварительная сортировка кандидатных ходов так, чтобы сильные/тактические ходы шли раньше. Тогда alpha-beta делает больше отсечений и смотрит меньше узлов.  
+**EN:** It is ordering candidate moves so strong/tactical moves are searched first. This increases alpha-beta cutoffs and reduces explored nodes.
+
+### 10) Что такое iterative deepening?
+**RU:** Поиск по глубинам 1,2,3,… с сохранением лучшего хода на каждом уровне. Это дает стабильный результат при тайм-лимите и улучшает порядок ходов для следующих глубин.  
+**EN:** Search runs at depths 1,2,3,… while keeping the best move from each completed depth. It is robust under time limits and improves move ordering for deeper iterations.
+
+### 11) Зачем transposition table и Zobrist hash?
+**RU:** Одинаковые позиции могут возникать разными путями. TT кэширует уже посчитанные оценки, а Zobrist дает быстрый ключ позиции для этого кэша.  
+**EN:** The same position can be reached via different move orders. TT caches evaluated states, and Zobrist hashing provides fast position keys.
+
+### 12) Что такое killer moves?
+**RU:** Это ходы, которые ранее вызвали сильное отсечение на той же глубине. Мы поднимаем их приоритет, чтобы быстрее получать новые cutoff.  
+**EN:** These are moves that previously caused strong cutoffs at the same depth. We prioritize them to trigger future cutoffs earlier.
+
+### 13) Что такое LMR (late move reductions)?
+**RU:** Для поздних и менее тактических ходов мы уменьшаем глубину поиска. Это ускоряет дерево при малой потере качества в среднем.  
+**EN:** Late, less tactical moves are searched at reduced depth. This improves speed with limited average quality loss.
+
+### 14) Как вы контролируете время поиска?
+**RU:** Есть дедлайн на итеративный поиск; при достижении лимита поиск останавливается и возвращается лучший уже подтвержденный результат с завершенной глубины.  
+**EN:** There is a search deadline; when time is up, the engine stops and returns the best move from the last completed depth.
+
+### 15) Почему в критерии сказано “если не объяснил — 0”?
+**RU:** Потому что цель — проверить понимание, а не только запуск кода. Невозможность объяснить алгоритм означает отсутствие подтвержденного владения реализацией.  
+**EN:** Because the criterion evaluates understanding, not just runnable code. If the student cannot explain the algorithm, ownership and comprehension are not demonstrated.
+
+---
+
+## 30-second closing statement (RU)
+Мы используем Minimax-family в виде iterative deepening alpha-beta с практическими оптимизациями (move ordering, TT/Zobrist, killer moves, LMR, aspiration). Эвристика комбинирует тактику и позицию: захваты, потенциальные захваты, уязвимые пары, открытость и длину линий. Поиск ограничен временем, поэтому всегда возвращает лучший подтвержденный ход.  
+
+## 30-second closing statement (EN)
+We use a Minimax-family engine: iterative deepening alpha-beta with practical optimizations (move ordering, TT/Zobrist, killer moves, LMR, aspiration). The heuristic blends tactical and positional terms: captures, potential captures, vulnerable pairs, and line length/openness. Search is time-bounded and always returns the best fully verified move.
+
+
+
+
+Ниже — **как у тебя устроен порядок вызовов** для поиска с alpha-beta (по `src/AI.cpp` + вызов из `Controller`).
+
+## Откуда всё стартует (не AI loop)
+
+- В режиме ИИ: `Controller::launchAiSearch` → в потоке вызывается `computeSimpleSuggestion(snapshot, player)`.
+- Кнопка Suggestion: `EngineAPI::suggest` → `computeSimpleSuggestion(state_, player)`.
+
+То есть **единственная “точка входа” в поиск** — `computeSimpleSuggestion`.
+
+---
+
+## Порядок внутри `computeSimpleSuggestion`
+
+1. **Проверка**: если `game.gameOver` — сразу выход, без поиска.
+
+2. **Копия корня**  
+   `root = game`, `root.currentPlayer = player`.
+
+3. **Ранний дебют** (опционально)  
+   `fastOpeningMove(root)`  
+   - если сработал — возврат **без** `alphaBeta` (эвристика + глубина 1).
+
+4. **Инициализация поиска**  
+   - `stats.deadline` от `SEARCH_TIME_BUDGET_MS`  
+   - обнуление `killerMoves`  
+   - `transpositionTable().reserve(500000)` (один раз)
+
+5. **Список ходов на корне**  
+   `generateCandidateMoves(root, player, 0, nullptr)`  
+   Если пусто — “no-legal-moves”.
+
+6. **Инициализация `rootMoves`**  
+   пары (позиция, `quickMoveScore`).
+
+7. **Iterative deepening**  
+   `for (depth = 1; depth <= MAX_SEARCH_DEPTH; ++depth)`:
+   - если `searchTimedOut(stats)` — **break** (берётся лучшее, что успели на предыдущей полной/частичной итерации).
+   - **Aspiration window** (с `depth > 1`): `windowAlpha/ Beta` вокруг прошлого `bestScore`.
+   - `runRootMoves(windowAlpha, windowBeta)`:
+     - `stable_sort` корневых ходов (бонус к прежнему `bestMove` через `PV_ROOT_SORT_BONUS`).
+     - Для **каждого** `rootMoves[i].first`:
+       - `placeStone(next, move)` (копия `root` → `next`)
+       - **основной рекурсивный вызов**  
+         `alphaBeta(next, depth - 1, alpha, beta, player, stats, 1)`  
+     - Если сработал `stats.timedOut` — итерация глубины не “completed”.
+   - Если аспирация “промахнулась” — повтор `runRootMoves(-INF, +INF)`.
+   - Обновляются `bestMove`, `bestScore`, `result.depth`.
+
+8. **Результат**  
+   `result.move`, `result.score`, `result.nodesExplored = stats.nodesExplored`.
+
+---
+
+## Что вызывается внутри `alphaBeta` (главная рекурсия)
+
+Для **каждого** узла дерева, пока глубина/время позволяют:
+
+1. **Лист/стоп**  
+   - `depthRemaining == 0` **или** `game.gameOver`  
+     → `evaluateBoardState(game, maximizingPlayer, ply)`.
+
+2. **Таймаут**  
+   - `searchTimedOut(stats)`  
+     → `evaluateBoardState` (оценка “сейчас”).
+
+3. **Transposition table**  
+   - `key = hashBoard(game) ^ (maximizingPlayer << 56)`  
+   - `hashBoard` внутри использует `computeZobristHash(game)` (из `Zobrist.cpp`).  
+   - Пробуем прочитать `TTEntry`: Exact / Lower / Upper, возможно `alpha >= beta` и ранний return.
+
+4. **Чей сейчас ход**  
+   `toPlay = game.currentPlayer`,  
+   `maximizing = (toPlay == maximizingPlayer)`.
+
+5. **Генерация и порядок ходов**  
+   `moves = generateCandidateMoves(game, toPlay, ply, &stats.killerMoves[ply])`  
+   - внутри: `quickMoveScore`, сортировка, лимит `effectiveCandidateLimit`, иногда `KILLER_BONUS`.
+
+6. **Перебор ходов** (цикл `for` по `moves`):
+
+   - ещё раз `searchTimedOut` → `evaluateBoardState` и return.
+
+   - `next = game`, `next.currentPlayer = toPlay`  
+   - `placeStone(next, move)` — **если не ok**, пропускаем.
+   - `++stats.nodesExplored`.
+
+   - **LMR (late move reduction)**  
+     считаем `childDepth = depthRemaining - 1` и, если ход “не тактический” и он **поздний** (индексы 2+ и 5+ и т.д.), **уменьшаем** `childDepth`.
+
+   - **PVS-стиль** (у тебя в коде “first full, others narrow window”):
+     - **первый** легальный ход: полный `alphaBeta(next, childDepth, alpha, beta, ...)`;
+     - **дальше**:
+       - на maximizing: сначала `alpha, alpha+1` (нулевое окно), при попадании в “окно” — полный re-search;
+       - на minimizing: `beta-1, beta` и т.п.
+
+   - После значения: обновляем `bestValue`, `alpha`/`beta`.
+
+   - **Beta cut / alpha cut**  
+     если `beta <= alpha` — обновляем `killerMoves[ply][0..3]` (сдвиг), **break** из цикла ходов.
+
+7. **Запись в TT**  
+   Считаем `bound` (Exact/Upper/Lower) и кладём `TTEntry{depthRemaining, bestValue, bound}`.
+
+8. `return bestValue`.
+
+---
+
+## Какие вспомогательные штуки тянет alpha-beta, но “не в каждом узле”
+
+- `evaluateBoardState` тянет `evaluateSequences`, `evaluatePotentialCaptures`, `countPairOpenness`, `evaluateVulnerablePairs`, и т.д. — **это твой статический eval на листьях/таймаутах**.
+- `placeStone` (из `Rules`/`GameState`) — реально меняет позицию, проверяет правила.
+- `countCapturesIfPlaced`, `isTacticalHotSpot` — в генерации/редукциях.
+
+---
+
+## Краткая схема (одна строка)
+
+`computeSimpleSuggestion` → (дебют?) → `generateCandidateMoves` (корень) → **for depth** → **for root move** → `placeStone` → **`alphaBeta`** → (TT read) → `generateCandidateMoves` → `placeStone` → **`alphaBeta`** → … → `evaluateBoardState` на глубине 0/терминал/таймаут → (TT write) → вверх по дереву.
+
+Если хочешь, могу так же **разложить одну конкретную строку** из твоего `alphaBeta` (первый легальный ход vs второй) и объяснить, почему у тебя это называют “Principal Variation / null-window” на защите.
+
+
+
+
+
+Here is the **English translation** of the explanation about how your alpha-beta flow is wired and in which order functions are called.
+
+---
+
+## Where everything starts (outside the AI search)
+
+- In **Vs AI** mode: `Controller::launchAiSearch` → in a thread it calls `computeSimpleSuggestion(snapshot, player)`.
+- For the **Suggestion** button: `EngineAPI::suggest` → `computeSimpleSuggestion(state_, player)`.
+
+So the **only search entry point** is `computeSimpleSuggestion`.
+
+---
+
+## Order inside `computeSimpleSuggestion`
+
+1. **Check**: if `game.gameOver` → return immediately, no search.
+
+2. **Root copy**  
+   `root = game`, `root.currentPlayer = player`.
+
+3. **Early opening** (optional)  
+   `fastOpeningMove(root)`  
+   - if it returns a move → return **without** `alphaBeta` (heuristic + depth 1).
+
+4. **Search setup**  
+   - `stats.deadline` from `SEARCH_TIME_BUDGET_MS`  
+   - reset `killerMoves`  
+   - `transpositionTable().reserve(500000)` (once)
+
+5. **Root move list**  
+   `generateCandidateMoves(root, player, 0, nullptr)`  
+   If empty → `"no-legal-moves"`.
+
+6. **Initialize `rootMoves`**  
+   pairs of (position, `quickMoveScore`).
+
+7. **Iterative deepening**  
+   `for (depth = 1; depth <= MAX_SEARCH_DEPTH; ++depth)`:
+   - if `searchTimedOut(stats)` → **break** (you keep the best result from the last completed/partial iteration).
+   - **Aspiration window** (when `depth > 1`): `windowAlpha` / `windowBeta` around the previous `bestScore`.
+   - `runRootMoves(windowAlpha, windowBeta)`:
+     - `stable_sort` root moves (bonus for the previous `bestMove` via `PV_ROOT_SORT_BONUS`).
+     - For **each** `rootMoves[i].first`:
+       - `placeStone(next, move)` (copy `root` → `next`)
+       - **main recursive call**  
+         `alphaBeta(next, depth - 1, alpha, beta, player, stats, 1)`  
+     - If `stats.timedOut` → this depth iteration is not “completed”.
+   - If aspiration **fails** → repeat `runRootMoves(-INF, +INF)`.
+   - Update `bestMove`, `bestScore`, `result.depth`.
+
+8. **Result**  
+   `result.move`, `result.score`, `result.nodesExplored = stats.nodesExplored`.
+
+---
+
+## What happens inside `alphaBeta` (main recursion)
+
+For **each** tree node, as long as depth/time allow:
+
+1. **Leaf / stop**  
+   - `depthRemaining == 0` **or** `game.gameOver`  
+     → `evaluateBoardState(game, maximizingPlayer, ply)`.
+
+2. **Timeout**  
+   - `searchTimedOut(stats)`  
+     → `evaluateBoardState` (current estimate).
+
+3. **Transposition table**  
+   - `key = hashBoard(game) ^ (maximizingPlayer << 56)`  
+   - `hashBoard` uses `computeZobristHash(game)` (from `Zobrist.cpp`).  
+   - Read `TTEntry`: Exact / Lower / Upper; possibly early return if `alpha >= beta`.
+
+4. **Side to move**  
+   `toPlay = game.currentPlayer`,  
+   `maximizing = (toPlay == maximizingPlayer)`.
+
+5. **Move generation and ordering**  
+   `moves = generateCandidateMoves(game, toPlay, ply, &stats.killerMoves[ply])`  
+   - inside: `quickMoveScore`, sorting, limit `effectiveCandidateLimit`, sometimes `KILLER_BONUS`.
+
+6. **Move loop** (`for` over `moves`):
+
+   - `searchTimedOut` again → `evaluateBoardState` and return.
+
+   - `next = game`, `next.currentPlayer = toPlay`  
+   - `placeStone(next, move)` — if **not** `ok`, skip.
+   - `++stats.nodesExplored`.
+
+   - **LMR (late move reduction)**  
+     `childDepth = depthRemaining - 1` and, if the move is **not tactical** and **late** (indices 2+, 5+, etc.), **reduce** `childDepth`.
+
+   - **PVS-style** (in your code: “first full window, others narrow window”):
+     - **first** legal move: full `alphaBeta(next, childDepth, alpha, beta, ...)`;
+     - **later** moves:
+       - on maximizing side: first window `alpha, alpha+1` (null window), then full re-search if needed;
+       - on minimizing side: `beta-1, beta`, then re-search similarly.
+
+   - After the value: update `bestValue`, `alpha` / `beta`.
+
+   - **Cutoff**  
+     if `beta <= alpha` — update `killerMoves[ply][0..3]` (shift), **break** the move loop.
+
+7. **TT write**  
+   Compute `bound` (Exact / Upper / Lower) and store `TTEntry{depthRemaining, bestValue, bound}`.
+
+8. `return bestValue`.
+
+---
+
+## Helpers that alpha-beta relies on (not every node for all of them)
+
+- `evaluateBoardState` pulls in `evaluateSequences`, `evaluatePotentialCaptures`, `countPairOpenness`, `evaluateVulnerablePairs`, etc. — your **static evaluation** at leaves / timeouts.
+- `placeStone` (from `Rules` / `GameState`) — applies the real game rules.
+- `countCapturesIfPlaced`, `isTacticalHotSpot` — used in generation / reductions.
+
+---
+
+## One-line summary
+
+`computeSimpleSuggestion` → (opening?) → `generateCandidateMoves` (root) → **for depth** → **for root move** → `placeStone` → **`alphaBeta`** → (TT read) → `generateCandidateMoves` → `placeStone` → **`alphaBeta`** → … → `evaluateBoardState` at depth 0 / terminal / timeout → (TT write) → propagate up the tree.
+
+
+`Alpha-Beta` у тебя делает главное: **вычисляет, насколько хорош ход с учетом ответов соперника**, и при этом отсекает лишние ветки, чтобы считать быстрее.
+
+Просто по шагам:
+
+1. Берет текущую позицию и список кандидатов.
+2. Рекурсивно смотрит варианты:
+   - наш ход (max),
+   - ответ соперника (min),
+   - снова наш ход и т.д.
+3. На листе дерева вызывает `evaluateBoardState(...)` и получает score.
+4. Этот score поднимается вверх:
+   - max-уровни берут максимум,
+   - min-уровни берут минимум.
+5. Во время обхода ведет границы:
+   - `alpha` — что уже гарантировал max,
+   - `beta` — что уже гарантировал min.
+6. Если становится `beta <= alpha`, ветка **сразу отбрасывается** (prune), потому что она уже не сможет улучшить результат.
+
+Итог:
+- без alpha-beta ты бы проверял намного больше узлов;
+- с alpha-beta получаешь **тот же minimax-результат**, но быстрее;
+- за счет этого успеваешь смотреть глубже за тот же лимит времени.
+
+Короткая формулировка для защиты:
+> Alpha-Beta is an optimized Minimax recursion: it evaluates move quality under best opponent responses and prunes branches that cannot affect the final decision, preserving correctness while reducing node count.
+
+Отличный вопрос — это **два разных типа оценки**.
+
+## Главное различие
+
+- `quickMoveScore(...)` — **быстрая локальная оценка одного кандидата хода** (клетки), чтобы **упорядочить и отфильтровать** ходы перед глубоким поиском.
+- `evaluateBoardState(...)` — **полная статическая оценка всей позиции**, которую alpha-beta использует в листьях/при таймауте как реальное значение узла.
+
+---
+
+## Где каждая используется
+
+- `quickMoveScore`:
+  - внутри `generateCandidateMoves(...)` для сортировки ходов;
+  - на корне при инициализации `rootMoves`.
+- `evaluateBoardState`:
+  - в `alphaBeta(...)`, когда `depthRemaining == 0`, `gameOver` или `timedOut`.
+
+---
+
+## Как считаются оценки в `quickMoveScore`
+
+`quickMoveScore(game, pos, player)`:
+1. Проверяет, что `pos` пустая и в пределах доски.
+2. Даёт очень большие бонусы за:
+   - немедленную 5-ку для себя (`+5,000,000`),
+   - блок немедленной 5-ки соперника (`+4,500,000`).
+3. Учитывает захваты:
+   - `capGain * 22000`,
+   - `blockGain * 26000`.
+4. Учитывает race по захватам (бонусы вплоть до `+7,500,000` при доборе до 10).
+5. Добавляет бонус за давление захватов (`latentCaptureProximityBonus`).
+6. Добавляет линейные бонусы:
+   - `maxLineLengthIfPlaced(..., player) * 5000`,
+   - `maxLineLengthIfPlaced(..., enemy) * 3500`.
+7. Небольшой бонус за центр + локальную плотность камней вокруг клетки.
+
+**Идея:** быстро понять, какие ходы перспективнее смотреть первыми.
+
+---
+
+## Как считается `evaluateBoardState`
+
+`evaluateBoardState(game, maximizingPlayer, ply)`:
+1. Сначала терминал:
+   - победа/поражение -> `±WIN_SCORE` с поправкой на `ply`.
+2. Затем полная позиционная сумма:
+   - разница текущих захватов: `(myCaptures - oppCaptures) * 3200`,
+   - особая логика near-10 captures (`+4,000,000`, `-4,500,000`),
+   - потенциальные захваты обеих сторон (`+1750` / `-3400` множители),
+   - открытость пар (`countPairOpenness`),
+   - уязвимые пары (`evaluateVulnerablePairs`),
+   - штраф за угрозу через `lastMove`,
+   - итоговые последовательности:
+     - `+ evaluateSequences(my)`
+     - `- evaluateSequences(opp)`.
+3. `evaluateSequences` использует `sequenceScore(length, openEnds)`, например:
+   - 5+ -> `200000`,
+   - open 4 -> `100000`,
+   - semi-open 4 -> `10000`,
+   - и т.д.
+
+**Идея:** это уже не “предсортировка”, а реальная оценка позиции для minimax-решения.
+
+---
+
+## Почему важно не путать
+
+- Шкалы у них разные и не обязаны совпадать.
+- `quickMoveScore` может быть грубее/агрессивнее — главное хорошо ранжировать.
+- `evaluateBoardState` должна быть стабильной и двухсторонней (мы vs соперник), потому что именно она определяет значение узлов в дереве.
+
+Коротко:  
+`quickMoveScore` = **move ordering heuristic**,  
+`evaluateBoardState` = **leaf evaluation for alpha-beta**.
+
+
+Конечно. Ниже твои **расценки (веса)** из эвристики — что за что начисляется/штрафуется.
+
+## 1) `sequenceScore(length, openEnds)` — оценка линий
+
+- `length >= 5` → `+200000`
+- `length == 4`:
+  - `openEnds == 2` → `+100000`
+  - `openEnds == 1` → `+10000`
+  - `openEnds == 0` → `0`
+- `length == 3`:
+  - `openEnds == 2` → `+15000`
+  - `openEnds == 1` → `+1200`
+  - `openEnds == 0` → `0`
+- `length == 2`:
+  - `openEnds == 2` → `+700`
+  - `openEnds == 1` → `+120`
+  - `openEnds == 0` → `0`
+- `length == 1`:
+  - `openEnds == 2` → `+30`
+  - иначе `0`
+
+---
+
+## 2) `evaluateBoardState(...)` — полная статическая оценка позиции
+
+### Захваты
+- `(myCaptures - oppCaptures) * 3200`
+
+### Гонка до 10 захватов
+- если `myCaptures + myGainNow >= 10` → `+4000000`
+- если `oppCaptures + oppGainNow >= 10` → `-4500000`
+
+### Потенциальные захваты
+- `+ evaluatePotentialCaptures(my) * 1750`
+- `- evaluatePotentialCaptures(opp) * 3400`
+
+### Открытые пары
+- `+ oppOO.doubleOpen * 3200 + oppOO.semiOpen * 1900`
+- `- myOO.doubleOpen * 4200 + ...`
+- точнее: `- (myOO.doubleOpen * 4200 + myOO.semiOpen * 2400)`
+
+### Доп. бонус/штраф за количество захватов
+- если `myCaptures >= 6` → `+ (myCaptures - 5) * 4500`
+- если `oppCaptures >= 6` → `- (oppCaptures - 5) * 4500`
+- если `capLead >= 4` → `+ (capLead - 3) * 2000`
+- если `capLead <= -4` → `+ (capLead + 3) * 2000` (это отрицательно при сильном минусе)
+
+### Уязвимые пары
+- `- evaluateVulnerablePairs(my) * 2600`
+- `+ evaluateVulnerablePairs(opp) * 1400`
+
+### Последний ход соперника
+- если `lastMove` соперника:
+  - `- maxLineLengthAt(..., opponent) * 600`
+
+### Итог по линиям
+- `+ evaluateSequences(my)`
+- `- evaluateSequences(opp)`
+
+---
+
+## 3) `quickMoveScore(...)` — быстрая оценка кандидата хода
+
+### Немедленные критические линии
+- если ход даёт свою 5-ку → `+5000000`
+- если ход блокирует 5-ку соперника → `+4500000`
+
+### Захваты на этом ходе
+- `capGain * 22000`
+- `blockGain * 26000`
+
+### Capture race
+- если `myCap + capGain >= 10` → `+7500000`
+- если `myCap >= 6 && capGain > 0` → `+ capGain*12000 + (10-myCap)*8000`
+- если `oppCap >= 6 && capGain > 0` → `+ capGain*15000 + (oppCap-4)*6000`
+- если `oppCap >= 8 && blockGain > 0` → `+6000000`
+
+### Давление по захватам
+- при `capPressure >= 4`:
+  - `+ latentCaptureProximityBonus(...)` (внутри обычно по `+14000/+9000` паттернам)
+
+### Линейный потенциал
+- `+ maxLineLengthIfPlaced(my) * 5000`
+- `+ maxLineLengthIfPlaced(opp) * 3500`
+
+### Позиционный бонус
+- центр: `+ 60 - 3 * ManhattanDistanceToCenter`
+- соседи в радиусе 2:
+  - за своего соседа `+120`
+  - за соседа соперника `+90`
+
+---
+
+Если хочешь, могу сделать следующей репликой **короткую табличную версию “для вставки в answers”** (очень компактно, в 15–20 строк).
+
+
+
+Готово — вот компактная табличная версия для `answers`.
+
+## Heuristic Weights (Compact)
+
+### 1) Sequence scoring (`sequenceScore`)
+| Pattern | Score |
+|---|---:|
+| length >= 5 | 200000 |
+| length = 4, openEnds = 2 | 100000 |
+| length = 4, openEnds = 1 | 10000 |
+| length = 3, openEnds = 2 | 15000 |
+| length = 3, openEnds = 1 | 1200 |
+| length = 2, openEnds = 2 | 700 |
+| length = 2, openEnds = 1 | 120 |
+| length = 1, openEnds = 2 | 30 |
+
+---
+
+### 2) Full static eval (`evaluateBoardState`)
+| Term | Formula |
+|---|---|
+| Capture lead | `(myCaptures - oppCaptures) * 3200` |
+| Capture-race win now (self) | `+4000000` if `myCaptures + myGainNow >= 10` |
+| Capture-race win now (opp) | `-4500000` if `oppCaptures + oppGainNow >= 10` |
+| Potential captures (self) | `+ evaluatePotentialCaptures(my) * 1750` |
+| Potential captures (opp) | `- evaluatePotentialCaptures(opp) * 3400` |
+| Opp pair openness | `+ oppOO.doubleOpen * 3200 + oppOO.semiOpen * 1900` |
+| Own pair openness penalty | `- (myOO.doubleOpen * 4200 + myOO.semiOpen * 2400)` |
+| High own captures | `+ (myCaptures - 5) * 4500` if `myCaptures >= 6` |
+| High opp captures | `- (oppCaptures - 5) * 4500` if `oppCaptures >= 6` |
+| Big capture lead | `+ (capLead - 3) * 2000` if `capLead >= 4` |
+| Big capture deficit | `+ (capLead + 3) * 2000` if `capLead <= -4` |
+| Own vulnerable pairs | `- evaluateVulnerablePairs(my) * 2600` |
+| Opp vulnerable pairs | `+ evaluateVulnerablePairs(opp) * 1400` |
+| Last-move threat (opp) | `- maxLineLengthAt(..., opponent) * 600` |
+| Sequence total | `+ evaluateSequences(my) - evaluateSequences(opp)` |
+
+---
+
+### 3) Fast move ordering score (`quickMoveScore`)
+| Term | Score |
+|---|---:|
+| Immediate own 5-in-row | +5000000 |
+| Immediate block opp 5-in-row | +4500000 |
+| Capture gain | `capGain * 22000` |
+| Block capture gain | `blockGain * 26000` |
+| Reach 10 captures now | +7500000 |
+| If `myCap >= 6 && capGain > 0` | `+ capGain*12000 + (10-myCap)*8000` |
+| If `oppCap >= 6 && capGain > 0` | `+ capGain*15000 + (oppCap-4)*6000` |
+| If `oppCap >= 8 && blockGain > 0` | +6000000 |
+| Line potential (self) | `+ maxLineLengthIfPlaced(my) * 5000` |
+| Line potential (opp) | `+ maxLineLengthIfPlaced(opp) * 3500` |
+| Center bias | `+ 60 - 3 * distToCenter` |
+| Neighbor bonus (self stone nearby) | +120 each |
+| Neighbor bonus (opp stone nearby) | +90 each |
+
+Если нужно, сделаю еще ultra-short версию в 8–10 строк (совсем для шпаргалки на защиту).
