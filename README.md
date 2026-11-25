@@ -175,6 +175,8 @@ When a player forms five or more stones in a row:
 1. The game checks if the opponent can break **every** winning line with a **single flank capture**.
 2. If so, the five-in-a-row is considered **deferred** – play continues.
 3. If the opponent has no capture that breaks all winning runs, the mover wins immediately.
+   <img width="1495" height="709" alt="Screenshot 2026-04-21 155612" src="https://github.com/user-attachments/assets/489c11a9-2ac9-4a3c-b6ff-281b6fde6181" />
+
 
 ### Forbidden Move (Double-Three)
 
