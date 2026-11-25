@@ -175,11 +175,22 @@ When a player forms five or more stones in a row:
 1. The game checks if the opponent can break **every** winning line with a **single flank capture**.
 2. If so, the five-in-a-row is considered **deferred** – play continues.
 3. If the opponent has no capture that breaks all winning runs, the mover wins immediately.
-   <img width="1495" height="709" alt="Screenshot 2026-04-21 155612" src="https://github.com/user-attachments/assets/489c11a9-2ac9-4a3c-b6ff-281b6fde6181" />
+
 
 
 ### Forbidden Move (Double-Three)
 
 Black (Blue) is prohibited from making a move that simultaneously creates two separate "open three" patterns (a free-three that could become an open-four). If a move creates both a capture and a double-three, the capture takes precedence, and the move is allowed. This rule applies only to Black (the first player) per standard Gomoku conventions.
+
+<img width="1495" height="709" alt="Screenshot 2026-04-21 155612" src="https://github.com/user-attachments/assets/489c11a9-2ac9-4a3c-b6ff-281b6fde6181" />
+
+<img width="1090" height="817" alt="Screenshot 2026-04-19 202546" src="https://github.com/user-attachments/assets/c0d17deb-f961-49bd-9326-40cb83479ebe" />
+
+<img width="1117" height="842" alt="Screenshot 2026-04-18 225221" src="https://github.com/user-attachments/assets/1d961c57-039e-42e5-8337-1847fc160060" />
+
+<img width="1094" height="807" alt="Screenshot 2026-04-19 193419" src="https://github.com/user-attachments/assets/4f70b0b3-6365-4802-8539-23f8314269c7" />
+
+
+
 
 
